@@ -62,7 +62,7 @@ from deepspeed.runtime.dataloader import DeepSpeedDataLoader
 from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
 from deepspeed.runtime.constants import \
     ROUTE_TRAIN, ROUTE_PREDICT, ROUTE_EVAL, \
-    PLD_THETA, PLD_GAMMA, BFLOAT16, FP16, AMP, GRADIENT_ACCUMULATION_STEPS, \
+    BFLOAT16, FP16, AMP, GRADIENT_ACCUMULATION_STEPS, \
     DATA_PARALLEL_GROUP, GLOBAL_RANK, DDP_BFLOAT16, GRADIENT_ALLREDUCE_OP_MEAN
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.checkpoint.constants import (
@@ -101,7 +101,6 @@ from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallCl
     STEP_GLOBAL_TIMER
 from deepspeed.utils.debug import debug_extract_module_and_param_names, debug_clear_module_and_param_names
 from deepspeed.monitor.monitor import MonitorMaster
-from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
 from deepspeed.runtime.utils import clip_grad_norm_, compare_tensors_in_structures, maybe_loss_for_backward
 from deepspeed.runtime.data_pipeline.constants import DATA_SAMPLING, \
     DATA_ROUTING, DATA_SAMPLING_ENABLED, CURRICULUM_LEARNING, \
@@ -545,7 +544,6 @@ class DeepSpeedEngine(Module):
         self.loaded_checkpoint_dp_world_size = None
         self.enable_backward_allreduce = True
         self.inside_no_sync_ctxt = False
-        self.progressive_layer_drop = None
         self.dist_backend = get_accelerator().communication_backend_name()
         self.has_moe_layers = False
         self.num_experts = []
@@ -698,9 +696,6 @@ class DeepSpeedEngine(Module):
         self.save_zero_checkpoint = False
         if not isinstance(self.optimizer, DeepSpeedZeRoOffload):
             self._configure_checkpointing()
-
-        if self.pld_enabled():
-            self.progressive_layer_drop = self._configure_progressive_layer_drop()
 
         if self.curriculum_enabled_legacy():
             self.curriculum_scheduler_legacy = self._configure_curriculum_scheduler_legacy()
@@ -1295,18 +1290,6 @@ class DeepSpeedEngine(Module):
                 return True
             else:
                 return False
-
-    def pld_enabled(self):
-        return self._config.pld_enabled
-
-    def pld_params(self):
-        return self._config.pld_params
-
-    def pld_theta(self):
-        return self.pld_params()[PLD_THETA]
-
-    def pld_gamma(self):
-        return self.pld_params()[PLD_GAMMA]
 
     def curriculum_enabled_legacy(self):
         return self._config.curriculum_enabled_legacy
@@ -2761,11 +2744,6 @@ class DeepSpeedEngine(Module):
 
         return optimizer
 
-    def _configure_progressive_layer_drop(self):
-        pld = ProgressiveLayerDrop(theta=self.pld_theta(), gamma=self.pld_gamma())
-
-        return pld
-
     def _configure_curriculum_scheduler_legacy(self):
         scheduler = CurriculumScheduler(self.curriculum_params_legacy())
         return scheduler
@@ -2911,10 +2889,6 @@ class DeepSpeedEngine(Module):
             self.flops_profiler.start_profile(ignore_list=None)
 
         if kwargs is not None:
-            if self.module.training:
-                if self.progressive_layer_drop:
-                    kwargs.update(self.progressive_layer_drop.get_state())
-
             if self.__class__.__name__ != "PipelineEngine":
                 # TODO: The above if condition is a HACK since for PipelineEngine
                 # it's difficult to inject argument in forward pass.
@@ -3620,9 +3594,6 @@ class DeepSpeedEngine(Module):
             if self.checkpoint_engine.is_decoupled():
                 self._commit_decoupled_checkpoint()
 
-            if self.progressive_layer_drop:
-                self.progressive_layer_drop.update_state(self.global_steps)
-
             self._take_model_step(lr_kwargs)
 
             report_progress = self.global_rank == 0 if self.global_rank else True
@@ -3797,12 +3768,6 @@ class DeepSpeedEngine(Module):
             return self._get_optimizer_param("momentum")
         else:
             return self._get_optimizer_param("betas")
-
-    def get_pld_theta(self):
-        if self.progressive_layer_drop:
-            return self.progressive_layer_drop.get_theta()
-        else:
-            return None
 
     def _report_progress(self, step):
         lr = self.get_lr()
